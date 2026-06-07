@@ -2,11 +2,11 @@ lio:
   # Map settings
   map:
     save_map: true
-    if_filter: true
+    if_filter: false
     save_map_dir: "map"
     map_name: "map.pcd"
-    ds_size: 0.25
-    save_interval: 500    # -1 stores all frames directly (may cause excessive memory usage).
+    ds_size: 0.05
+    save_interval: 1    # -1 stores all frames directly (may cause excessive memory usage).
                           # Values > 0 save one frame every N frames, then merge at the end.
 
   # ROS Topic input
@@ -23,9 +23,9 @@ lio:
     lidar_type: 1
     blind: 2.0
     maxrange: 60.0
-    filter_rate: 3.0
-    enable_downsample: true
-    voxel_fliter_size: 0.5
+    filter_rate: 1.0
+    enable_downsample: false
+    voxel_fliter_size: 0.25
     gravity_norm: 9.7946
     imu_type: 1
     imu_na: 0.1
