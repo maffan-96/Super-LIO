@@ -50,6 +50,7 @@ protected:
   virtual void Output();
   void caceData();
   void ProcessCaceMap();
+  void appendScanPose(int counter, const NavState& state);
 
   using StateFn = void (SuperLIO::*)();
   using OctVoxMapType = OctVoxMap<BASIC::V3, BASIC::scalar>;
@@ -79,6 +80,7 @@ protected:
   std::vector<std::pair<BASIC::M6, BASIC::V6>> H_R_;
   std::vector<std::array<double, 4>> abcd_vec_;
   int pcd_index_ = -1;
+  NavState last_cace_state_;   ///< SLAM pose of the most recent registered scan added to point_map_
 
   Timer time_record_;
 };
