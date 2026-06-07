@@ -1,6 +1,9 @@
 
 #include "lio/super_lio.h"
 
+#include <cmath>
+#include <fstream>
+#include <iomanip>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -224,6 +227,7 @@ void SuperLIO::caceData(){
   static int scan_wait_num = 0;
   if(!world_pc_->empty()){
     *point_map_ += *world_pc_;
+    last_cace_state_ = state;   // pose of the latest registered scan in this fragment
     scan_wait_num++;
   }
 
@@ -240,6 +244,10 @@ void SuperLIO::caceData(){
     res = system(cmd.c_str());
     cmd = "mkdir -p " + g_save_map_dir + "/PCD";
     res = system(cmd.c_str());
+
+    // (Re)create the SLAM pose file (Oxford Spires style): one pose per saved PCD.
+    std::ofstream pose_ofs(g_save_map_dir + "/slam_poses.csv", std::ios::trunc);
+    pose_ofs << "# counter, sec, nsec, x, y, z, qx, qy, qz, qw\n";
   }
 
   if (point_map_->size() > 0 && scan_wait_num >= g_pcd_save_interval) {
@@ -248,9 +256,35 @@ void SuperLIO::caceData(){
                                std::string(".pcd"));
     LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
     pcl::io::savePCDFileBinary(map_name, *point_map_);
+    appendScanPose(pcd_index_, last_cace_state_);
     point_map_->clear();
     scan_wait_num = 0;
   }
+}
+
+
+void SuperLIO::appendScanPose(int counter, const NavState& state){
+  // Writes one pose line matching the PCD fragment "scans_<counter>.pcd".
+  // Format: counter, sec, nsec, x, y, z, qx, qy, qz, qw   (world <- imu/body SLAM pose)
+  const std::string csv_path = g_save_map_dir + "/slam_poses.csv";
+  std::ofstream ofs(csv_path, std::ios::app);
+  if(!ofs.is_open()){
+    LOG(WARNING) << RED << " ---> Failed to open pose file: " << csv_path << RESET;
+    return;
+  }
+
+  const double ts = state.timestamp;
+  long sec  = static_cast<long>(std::floor(ts));
+  long nsec = static_cast<long>(std::llround((ts - static_cast<double>(sec)) * 1e9));
+  if(nsec >= 1000000000L){ nsec -= 1000000000L; sec += 1; }   // guard rounding overflow
+
+  const V3 p = state.p;
+  const V4 q = state.R.coeffs();   // [qx, qy, qz, qw], same convention as pub_odom
+
+  ofs << counter << ", " << sec << ", " << nsec << ", "
+      << std::setprecision(9)
+      << p[0] << ", " << p[1] << ", " << p[2] << ", "
+      << q[0] << ", " << q[1] << ", " << q[2] << ", " << q[3] << "\n";
 }
 
 
@@ -319,6 +353,7 @@ void SuperLIO::saveMap(){
                                  std::string(".pcd"));
       LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
       pcl::io::savePCDFileBinary(map_name, *point_map_);
+      appendScanPose(pcd_index_, last_cace_state_);
       point_map_->clear();
     }
     LOG(INFO) << GREEN << " ---> Save last cace success. " << RESET;
