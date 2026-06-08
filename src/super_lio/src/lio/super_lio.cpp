@@ -2,6 +2,7 @@
 #include "lio/super_lio.h"
 
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <sys/resource.h>
@@ -211,6 +212,26 @@ void SuperLIO::stateProcess(){
 }
 
 
+// Split an epoch timestamp (seconds, double) into integer (sec, nsec),
+// matching ros::Time::fromSec and the meshing loader's "%010ld_%09ld" key.
+static inline void split_stamp(double ts, long& sec, long& nsec){
+  sec  = static_cast<long>(std::floor(ts));
+  nsec = static_cast<long>(std::llround((ts - static_cast<double>(sec)) * 1e9));
+  if(nsec >= 1000000000L){ nsec -= 1000000000L; sec += 1; }   // guard rounding overflow
+}
+
+// Build the PCD fragment basename "scans_<sec>_<nsec>" for a given pose.
+// The trailing <sec>_<nsec> is what the meshing loader matches against the
+// pose CSV; the "scans_" prefix keeps ProcessCaceMap's merge filter working.
+static inline std::string scan_basename(double ts){
+  long sec, nsec;
+  split_stamp(ts, sec, nsec);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "scans_%ld_%09ld", sec, nsec);
+  return std::string(buf);
+}
+
+
 void SuperLIO::caceData(){
   if(!g_save_map) return;
   auto state = kf_->GetNavState();
@@ -252,9 +273,9 @@ void SuperLIO::caceData(){
 
   if (point_map_->size() > 0 && scan_wait_num >= g_pcd_save_interval) {
     pcd_index_++;
-    std::string map_name(std::string(g_save_map_dir + "/PCD/scans_") + std::to_string(pcd_index_) +
-                               std::string(".pcd"));
-    LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
+    const std::string base = scan_basename(last_cace_state_.timestamp);
+    std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
+    LOG(INFO) << GREEN << " ---> current scan saved to /PCD/" << base << "  size:  " << point_map_->size() << RESET;
     pcl::io::savePCDFileBinary(map_name, *point_map_);
     appendScanPose(pcd_index_, last_cace_state_);
     point_map_->clear();
@@ -264,7 +285,8 @@ void SuperLIO::caceData(){
 
 
 void SuperLIO::appendScanPose(int counter, const NavState& state){
-  // Writes one pose line matching the PCD fragment "scans_<counter>.pcd".
+  // Writes one pose line for the matching PCD fragment "scans_<sec>_<nsec>.pcd".
+  // The meshing loader keys on (sec, nsec); counter is informational only.
   // Format: counter, sec, nsec, x, y, z, qx, qy, qz, qw   (world <- imu/body SLAM pose)
   const std::string csv_path = g_save_map_dir + "/slam_poses.csv";
   std::ofstream ofs(csv_path, std::ios::app);
@@ -273,10 +295,8 @@ void SuperLIO::appendScanPose(int counter, const NavState& state){
     return;
   }
 
-  const double ts = state.timestamp;
-  long sec  = static_cast<long>(std::floor(ts));
-  long nsec = static_cast<long>(std::llround((ts - static_cast<double>(sec)) * 1e9));
-  if(nsec >= 1000000000L){ nsec -= 1000000000L; sec += 1; }   // guard rounding overflow
+  long sec, nsec;
+  split_stamp(state.timestamp, sec, nsec);   // identical (sec, nsec) to the PCD filename
 
   const V3 p = state.p;
   const V4 q = state.R.coeffs();   // [qx, qy, qz, qw], same convention as pub_odom
@@ -349,9 +369,9 @@ void SuperLIO::saveMap(){
     LOG(INFO) << YELLOW << " ---> Saving last cace ... " << RESET;
     if (point_map_->size() > 0) {
       pcd_index_++;
-      std::string map_name(std::string(g_save_map_dir + "/PCD/scans_") + std::to_string(pcd_index_) +
-                                 std::string(".pcd"));
-      LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
+      const std::string base = scan_basename(last_cace_state_.timestamp);
+      std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
+      LOG(INFO) << GREEN << " ---> current scan saved to /PCD/" << base << "  size:  " << point_map_->size() << RESET;
       pcl::io::savePCDFileBinary(map_name, *point_map_);
       appendScanPose(pcd_index_, last_cace_state_);
       point_map_->clear();
