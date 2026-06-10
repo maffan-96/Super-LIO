@@ -7,6 +7,9 @@ lio:
     map_name: "map.pcd"
     ds_size: 0.25
     save_interval: 500
+    export_lidar_frame: false   # true: save per-scan PCDs in the LiDAR sensor frame with
+                                # T_world_lidar poses in slam_poses.csv (for meshing/raycasting).
+                                # Requires save_interval > 0; each scan is saved individually.
 
   # ROS Topic input
   ros:
