@@ -37,6 +37,8 @@ namespace LI2Sup{
   extern std::string g_save_map_dir;
   extern float g_map_ds_size;
   extern int   g_pcd_save_interval;
+  extern bool  g_export_lidar_frame;  // save per-scan PCDs in the LiDAR sensor frame
+                                      // with T_world_lidar poses (for meshing/raycasting)
   
   extern std::string g_imu_topic;
   extern std::string g_lidar_topic;

@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <unordered_map>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -235,6 +237,20 @@ static inline std::string scan_basename(double ts){
 void SuperLIO::caceData(){
   if(!g_save_map) return;
   auto state = kf_->GetNavState();
+
+  if(g_export_lidar_frame){
+    if(g_pcd_save_interval > 0){
+      saveLidarFrameScan(state);
+      return;
+    }
+    static bool warned = false;
+    if(!warned){
+      warned = true;
+      LOG(WARNING) << RED << " ---> export_lidar_frame requires save_interval > 0; "
+                   << "falling back to world-frame map saving." << RESET;
+    }
+  }
+
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
   transformation.block<3, 1>(0, 3) = state.p.cast<float>();
@@ -277,17 +293,67 @@ void SuperLIO::caceData(){
     std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
     LOG(INFO) << GREEN << " ---> current scan saved to /PCD/" << base << "  size:  " << point_map_->size() << RESET;
     pcl::io::savePCDFileBinary(map_name, *point_map_);
-    appendScanPose(pcd_index_, last_cace_state_);
+    appendScanPose(pcd_index_, last_cace_state_.timestamp, last_cace_state_.GetSE3());
     point_map_->clear();
     scan_wait_num = 0;
   }
 }
 
 
-void SuperLIO::appendScanPose(int counter, const NavState& state){
+void SuperLIO::saveLidarFrameScan(const NavState& state){
+  // Mesher-compatible export: one PCD per registered scan, points kept in the
+  // LiDAR sensor frame, paired with the pose T_world_lidar in slam_poses.csv.
+  // The mesher reconstructs T_world_lidar * p_lidar = T_world_body * p_imu,
+  // i.e. the same world points that build map.pcd, and uses the pose
+  // translation as the ray origin for free-space carving.
+  static bool init_dir = false;
+  if(!init_dir){
+    init_dir = true;
+    std::string cmd = "rm -rf " + g_save_map_dir + "/PCD";
+    [[maybe_unused]] int res;
+    res = system(cmd.c_str());
+    cmd = "mkdir -p " + g_save_map_dir + "/PCD";
+    res = system(cmd.c_str());
+
+    std::ofstream pose_ofs(g_save_map_dir + "/slam_poses.csv", std::ios::trunc);
+    pose_ofs << "# counter, sec, nsec, x, y, z, qx, qy, qz, qw\n";
+    LOG(INFO) << YELLOW << " ---> LiDAR-frame export enabled: per-scan PCDs + T_world_lidar poses" << RESET;
+  }
+
+  if(scan_undistort_full_->empty()) return;
+
+  // scan_undistort_full_ is undistorted into the IMU/body frame at scan end
+  // time; map it back to the LiDAR frame: p_L = R_IL^T * (p_I - t_IL).
+  static const Eigen::Matrix4f T_lidar_imu = [](){
+    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+    const M3 R_li = g_lidar_imu.R_.transpose();
+    T.block<3, 3>(0, 0) = R_li.cast<float>();
+    T.block<3, 1>(0, 3) = (-(R_li * g_lidar_imu.t_)).cast<float>();
+    return T;
+  }();
+
+  PointCloudType::Ptr lidar_pc(new PointCloudType());
+  pcl::transformPointCloud(*scan_undistort_full_, *lidar_pc, T_lidar_imu);
+  if(lidar_pc->empty()) return;
+
+  pcd_index_++;
+  const std::string base = scan_basename(state.timestamp);
+  std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
+  pcl::io::savePCDFileBinary(map_name, *lidar_pc);
+  appendScanPose(pcd_index_, state.timestamp, state.GetSE3() * g_lidar_imu);
+
+  if(pcd_index_ % 100 == 0){
+    LOG(INFO) << GREEN << " ---> lidar-frame scan saved to /PCD/" << base
+              << "  size: " << lidar_pc->size() << "  (total scans: " << pcd_index_ + 1 << ")" << RESET;
+  }
+}
+
+
+void SuperLIO::appendScanPose(int counter, double timestamp, const SE3& pose){
   // Writes one pose line for the matching PCD fragment "scans_<sec>_<nsec>.pcd".
   // The meshing loader keys on (sec, nsec); counter is informational only.
-  // Format: counter, sec, nsec, x, y, z, qx, qy, qz, qw   (world <- imu/body SLAM pose)
+  // Format: counter, sec, nsec, x, y, z, qx, qy, qz, qw
+  // World-frame export: pose = T_world_body. LiDAR-frame export: pose = T_world_lidar.
   const std::string csv_path = g_save_map_dir + "/slam_poses.csv";
   std::ofstream ofs(csv_path, std::ios::app);
   if(!ofs.is_open()){
@@ -296,15 +362,47 @@ void SuperLIO::appendScanPose(int counter, const NavState& state){
   }
 
   long sec, nsec;
-  split_stamp(state.timestamp, sec, nsec);   // identical (sec, nsec) to the PCD filename
+  split_stamp(timestamp, sec, nsec);   // identical (sec, nsec) to the PCD filename
 
-  const V3 p = state.p;
-  const V4 q = state.R.coeffs();   // [qx, qy, qz, qw], same convention as pub_odom
+  const V3 p = pose.t_;
+  const Quat q = pose.quaternion();
 
   ofs << counter << ", " << sec << ", " << nsec << ", "
       << std::setprecision(9)
       << p[0] << ", " << p[1] << ", " << p[2] << ", "
-      << q[0] << ", " << q[1] << ", " << q[2] << ", " << q[3] << "\n";
+      << q.x() << ", " << q.y() << ", " << q.z() << ", " << q.w() << "\n";
+}
+
+
+// Loads slam_poses.csv into a map keyed by "<sec>_<nsec>" (the suffix of each
+// fragment filename), so lidar-frame fragments can be placed into the world
+// frame when merging the final map.
+static std::unordered_map<std::string, Eigen::Matrix4f> loadScanPoses(const std::string& csv_path){
+  std::unordered_map<std::string, Eigen::Matrix4f> poses;
+  std::ifstream ifs(csv_path);
+  if(!ifs.is_open()){
+    LOG(WARNING) << RED << " ---> Failed to open pose file: " << csv_path << RESET;
+    return poses;
+  }
+  std::string line;
+  while(std::getline(ifs, line)){
+    if(line.empty() || line[0] == '#') continue;
+    for(char& c : line) if(c == ',') c = ' ';
+    std::istringstream iss(line);
+    long counter, sec, nsec;
+    double x, y, z, qx, qy, qz, qw;
+    if(!(iss >> counter >> sec >> nsec >> x >> y >> z >> qx >> qy >> qz >> qw)) continue;
+    char key[32];
+    std::snprintf(key, sizeof(key), "%ld_%09ld", sec, nsec);
+    Eigen::Quaternionf q(static_cast<float>(qw), static_cast<float>(qx),
+                         static_cast<float>(qy), static_cast<float>(qz));
+    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+    T.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+    T.block<3, 1>(0, 3) = Eigen::Vector3f(static_cast<float>(x), static_cast<float>(y),
+                                          static_cast<float>(z));
+    poses[key] = T;
+  }
+  return poses;
 }
 
 
@@ -316,6 +414,15 @@ void SuperLIO::ProcessCaceMap(){
 
   LOG(INFO) << YELLOW << " ---> Merging PCD fragments in: " << pcd_folder << RESET;
 
+  // Lidar-frame fragments are sensor-frame clouds: each must be transformed by
+  // its T_world_lidar pose before merging so map.pcd stays in the world frame.
+  std::unordered_map<std::string, Eigen::Matrix4f> scan_poses;
+  if(g_export_lidar_frame){
+    scan_poses = loadScanPoses(g_save_map_dir + "/slam_poses.csv");
+    LOG(INFO) << YELLOW << " ---> LiDAR-frame fragments: loaded " << scan_poses.size()
+              << " poses for world-frame merging" << RESET;
+  }
+
   PointCloudType::Ptr merged_map(new PointCloudType());
 
   int count = 0;
@@ -324,9 +431,25 @@ void SuperLIO::ProcessCaceMap(){
       entry.path().filename().string().find("scans_") != std::string::npos) {
       PointCloudType::Ptr tmp_cloud(new PointCloudType());
       if (pcl::io::loadPCDFile<PointType>(entry.path().string(), *tmp_cloud) == 0) {
+        if(g_export_lidar_frame){
+          long sec = 0, nsec = 0;
+          const std::string stem = entry.path().stem().string();
+          if(std::sscanf(stem.c_str(), "scans_%ld_%ld", &sec, &nsec) != 2){
+            LOG(WARNING) << RED << " ---> Cannot parse timestamp from: " << stem << ", skipped." << RESET;
+            continue;
+          }
+          char key[32];
+          std::snprintf(key, sizeof(key), "%ld_%09ld", sec, nsec);
+          auto it = scan_poses.find(key);
+          if(it == scan_poses.end()){
+            LOG(WARNING) << RED << " ---> No pose for fragment: " << stem << ", skipped." << RESET;
+            continue;
+          }
+          pcl::transformPointCloud(*tmp_cloud, *tmp_cloud, it->second);
+        }
         *merged_map += *tmp_cloud;
         count++;
-        // LOG(INFO) << GREEN << " ---> Merged: " << entry.path().filename().string() 
+        // LOG(INFO) << GREEN << " ---> Merged: " << entry.path().filename().string()
         //           << "   size: " << tmp_cloud->size() << RESET;
       } else {
         LOG(WARNING) << RED << " ---> Failed to load: " << entry.path().string() << RESET;
@@ -373,7 +496,7 @@ void SuperLIO::saveMap(){
       std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
       LOG(INFO) << GREEN << " ---> current scan saved to /PCD/" << base << "  size:  " << point_map_->size() << RESET;
       pcl::io::savePCDFileBinary(map_name, *point_map_);
-      appendScanPose(pcd_index_, last_cace_state_);
+      appendScanPose(pcd_index_, last_cace_state_.timestamp, last_cace_state_.GetSE3());
       point_map_->clear();
     }
     LOG(INFO) << GREEN << " ---> Save last cace success. " << RESET;

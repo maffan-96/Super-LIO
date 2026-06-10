@@ -18,6 +18,8 @@ void LoadParamFromRos(ros::NodeHandle& nh){
   nh.getParam("/lio/map/map_name", g_map_name);
   nh.getParam("/lio/map/ds_size", g_map_ds_size);
   nh.getParam("/lio/map/save_interval", g_pcd_save_interval);
+  nh.getParam("/lio/map/export_lidar_frame", g_export_lidar_frame);
+  LOG(INFO) << GREEN << " ---> [Param] map/export_lidar_frame: " << (g_export_lidar_frame ? "true" : "false") << RESET;
 
   nh.getParam("/lio/eva/timer", g_time_eva);
   

@@ -49,8 +49,9 @@ protected:
   virtual void UpdateMap();
   virtual void Output();
   void caceData();
+  void saveLidarFrameScan(const NavState& state);
   void ProcessCaceMap();
-  void appendScanPose(int counter, const NavState& state);
+  void appendScanPose(int counter, double timestamp, const BASIC::SE3& pose);
 
   using StateFn = void (SuperLIO::*)();
   using OctVoxMapType = OctVoxMap<BASIC::V3, BASIC::scalar>;

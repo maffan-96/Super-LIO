@@ -8,6 +8,9 @@ lio:
     ds_size: 0.05
     save_interval: 1    # -1 stores all frames directly (may cause excessive memory usage).
                           # Values > 0 save one frame every N frames, then merge at the end.
+    export_lidar_frame: false   # true: save per-scan PCDs in the LiDAR sensor frame with
+                                # T_world_lidar poses in slam_poses.csv (for meshing/raycasting).
+                                # Requires save_interval > 0; each scan is saved individually.
 
   # ROS Topic input
   ros:
