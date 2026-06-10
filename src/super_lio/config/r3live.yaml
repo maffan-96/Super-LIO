@@ -10,6 +10,9 @@ lio:
     export_lidar_frame: false   # true: save per-scan PCDs in the LiDAR sensor frame with
                                 # T_world_lidar poses in slam_poses.csv (for meshing/raycasting).
                                 # Requires save_interval > 0; each scan is saved individually.
+    export_normals: false       # true (with export_lidar_frame): store per-point normals in the
+                                # per-scan PCDs (map plane fit, scan PCA fallback; lidar frame,
+                                # oriented toward the sensor) for meshing.
 
   # ROS Topic input
   ros:

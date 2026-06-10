@@ -3,11 +3,15 @@
 
 #include <cmath>
 #include <cstdio>
+#include <atomic>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
 #include <sys/resource.h>
+
+#include <pcl/kdtree/kdtree_flann.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_vector.h>
@@ -339,13 +343,175 @@ void SuperLIO::saveLidarFrameScan(const NavState& state){
   pcd_index_++;
   const std::string base = scan_basename(state.timestamp);
   std::string map_name = g_save_map_dir + "/PCD/" + base + ".pcd";
-  pcl::io::savePCDFileBinary(map_name, *lidar_pc);
-  appendScanPose(pcd_index_, state.timestamp, state.GetSE3() * g_lidar_imu);
+  const SE3 T_world_lidar = state.GetSE3() * g_lidar_imu;
+
+  std::array<long, 3> nstats{0, 0, 0};
+  if(g_export_normals){
+    pcl::PointCloud<pcl::PointXYZINormal> cloud_n;
+    nstats = computeScanNormals(lidar_pc, T_world_lidar, cloud_n);
+    pcl::io::savePCDFileBinary(map_name, cloud_n);
+  }else{
+    pcl::io::savePCDFileBinary(map_name, *lidar_pc);
+  }
+  appendScanPose(pcd_index_, state.timestamp, T_world_lidar);
 
   if(pcd_index_ % 100 == 0){
     LOG(INFO) << GREEN << " ---> lidar-frame scan saved to /PCD/" << base
               << "  size: " << lidar_pc->size() << "  (total scans: " << pcd_index_ + 1 << ")" << RESET;
+    if(g_export_normals){
+      const double tot = std::max<long>(1, nstats[0] + nstats[1] + nstats[2]);
+      LOG(INFO) << GREEN << " --->   normals: map-fit " << (100.0 * nstats[0] / tot)
+                << "%,  scan-PCA " << (100.0 * nstats[1] / tot)
+                << "%,  none " << (100.0 * nstats[2] / tot) << "%" << RESET;
+    }
   }
+}
+
+
+std::array<long, 3> SuperLIO::computeScanNormals(const CloudPtr& lidar_pc,
+                                                 const SE3& T_world_lidar,
+                                                 pcl::PointCloud<pcl::PointXYZINormal>& out){
+  // Two-tier normal estimation, most accurate source first:
+  //  1) Map plane fit: the same 5-NN iVox query + strict plane fit (0.1 m
+  //     inlier test) that registration trusts. Normals come from the
+  //     accumulated map, so they are denoised across many scans.
+  //  2) Scan-local PCA fallback for points the map cannot explain (sparse or
+  //     freshly-mapped areas, edges): k-NN within this scan, range-adaptive
+  //     radius, eigen analysis with degeneracy gates.
+  // Points that fail both keep a zero normal: the mesher then treats them as
+  // weak seed hypotheses instead of trusting a fabricated direction.
+  // Output normals are in the LiDAR sensor frame, oriented toward the sensor
+  // (origin), matching the saved point coordinates. curvature stores the fit
+  // quality: RMS point-to-plane residual (m) for map fits, PCL-style surface
+  // variation l0/(l0+l1+l2) for PCA; 1.0 marks points without a normal.
+  const std::size_t n = lidar_pc->size();
+  out.resize(n);
+  out.width = static_cast<uint32_t>(n);
+  out.height = 1;
+  out.is_dense = false;
+
+  const M3 R_wl = T_world_lidar.R_;
+  const M3 R_lw = R_wl.transpose();
+  const V3 t_wl = T_world_lidar.t_;
+
+  // All five map neighbors must lie this close to the query point for the
+  // plane fit to be trusted (rejects fits stitched across distant geometry).
+  constexpr float kMapGate2 = 1.0f;   // metres^2
+
+  std::vector<uint8_t> need_pca(n, 0);
+  std::atomic<long> n_map{0};
+
+  ivox_->reset_max_group();   // restore full KNN search breadth (Observe narrows it)
+
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, n),
+    [&](const tbb::blocked_range<size_t>& r){
+      KNNHeapType top_K;
+      std::array<double, 4> abcd;
+      long local_map = 0;
+      for(size_t i = r.begin(); i < r.end(); ++i){
+        const auto& src = lidar_pc->points[i];
+        auto& dst = out.points[i];
+        dst.x = src.x; dst.y = src.y; dst.z = src.z;
+        dst.intensity = src.intensity;
+        dst.normal_x = dst.normal_y = dst.normal_z = 0.0f;
+        dst.curvature = 1.0f;
+
+        const V3 p_l(src.x, src.y, src.z);
+        const V3 p_w = R_wl * p_l + t_wl;
+
+        top_K.reset();
+        ivox_->getTopK(p_w, top_K);
+        if(top_K.count == 5 && top_K.max_dist2_ <= kMapGate2 &&
+           calc_plane_coeff(5, top_K.points_, abcd)){
+          V3 n_l = R_lw * V3(abcd[0], abcd[1], abcd[2]);  // unit plane normal, world -> lidar
+          if(n_l.dot(p_l) > 0) n_l = -n_l;                // face the sensor at the origin
+          dst.normal_x = n_l[0]; dst.normal_y = n_l[1]; dst.normal_z = n_l[2];
+          double ss = 0.0;
+          for(int j = 0; j < 5; ++j){
+            const V3& q = top_K.points_[j];
+            const double d = abcd[0]*q[0] + abcd[1]*q[1] + abcd[2]*q[2] + abcd[3];
+            ss += d * d;
+          }
+          dst.curvature = static_cast<float>(std::sqrt(ss / 5.0));
+          local_map++;
+        }else{
+          need_pca[i] = 1;
+        }
+      }
+      n_map += local_map;
+    });
+
+  std::vector<int> pending;
+  pending.reserve(n / 4 + 1);
+  for(size_t i = 0; i < n; ++i) if(need_pca[i]) pending.push_back(static_cast<int>(i));
+
+  std::atomic<long> n_pca{0};
+  if(!pending.empty()){
+    pcl::KdTreeFLANN<PointType> kdtree;
+    kdtree.setInputCloud(lidar_pc);
+
+    constexpr int kPcaK = 14;   // self + up to 13 neighbors
+
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, pending.size()),
+      [&](const tbb::blocked_range<size_t>& r){
+        std::vector<int> idxs(kPcaK);
+        std::vector<float> d2s(kPcaK);
+        long local_pca = 0;
+        for(size_t k = r.begin(); k < r.end(); ++k){
+          const int i = pending[k];
+          const auto& src = lidar_pc->points[i];
+          auto& dst = out.points[i];
+          const V3 p_l(src.x, src.y, src.z);
+
+          const int found = kdtree.nearestKSearch(src, kPcaK, idxs, d2s);
+          if(found < 5) continue;
+
+          // Neighborhood radius grows with range so the fallback still works
+          // where the scan is sparse, without smearing across structures
+          // up close.
+          const float range = p_l.norm();
+          const float radius = std::clamp(0.04f * range, 0.30f, 2.00f);
+          const float radius2 = radius * radius;
+
+          V3 mean = V3::Zero();
+          int m = 0;
+          for(int j = 0; j < found; ++j){
+            if(d2s[j] > radius2) break;   // d2s is sorted ascending
+            const auto& q = lidar_pc->points[idxs[j]];
+            mean += V3(q.x, q.y, q.z);
+            m++;
+          }
+          if(m < 5) continue;
+          mean /= static_cast<float>(m);
+
+          M3 cov = M3::Zero();
+          for(int j = 0; j < m; ++j){
+            const auto& q = lidar_pc->points[idxs[j]];
+            const V3 d = V3(q.x, q.y, q.z) - mean;
+            cov += d * d.transpose();
+          }
+          cov /= static_cast<float>(m);
+
+          Eigen::SelfAdjointEigenSolver<M3> es(cov);
+          const V3 evals = es.eigenvalues();   // ascending
+          // Reject degenerate neighborhoods: a near-collinear point set (e.g.
+          // a single scan ring at long range) has no well-defined surface
+          // normal, and the mesher trusts input normals at full confidence.
+          if(evals[2] < 1e-12f || evals[1] < 0.01f * evals[2]) continue;
+
+          V3 n_l = es.eigenvectors().col(0);
+          if(n_l.dot(p_l) > 0) n_l = -n_l;     // face the sensor
+          dst.normal_x = n_l[0]; dst.normal_y = n_l[1]; dst.normal_z = n_l[2];
+          dst.curvature = evals[0] / (evals[0] + evals[1] + evals[2]);
+          local_pca++;
+        }
+        n_pca += local_pca;
+      });
+  }
+
+  const long got_map = n_map.load();
+  const long got_pca = n_pca.load();
+  return {got_map, got_pca, static_cast<long>(n) - got_map - got_pca};
 }
 
 

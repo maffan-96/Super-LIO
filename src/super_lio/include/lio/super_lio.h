@@ -3,6 +3,7 @@
 #ifndef SUPER_LIO_H_
 #define SUPER_LIO_H_
 
+#include <array>
 #include <queue>
 #include <vector>
 #include <iostream>
@@ -50,6 +51,11 @@ protected:
   virtual void Output();
   void caceData();
   void saveLidarFrameScan(const NavState& state);
+  /// Fills per-point normals (lidar frame, oriented toward the sensor).
+  /// Returns {map-fit, scan-PCA, no-normal} point counts.
+  std::array<long, 3> computeScanNormals(const BASIC::CloudPtr& lidar_pc,
+                                         const BASIC::SE3& T_world_lidar,
+                                         pcl::PointCloud<pcl::PointXYZINormal>& out);
   void ProcessCaceMap();
   void appendScanPose(int counter, double timestamp, const BASIC::SE3& pose);
 
