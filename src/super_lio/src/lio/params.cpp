@@ -21,6 +21,7 @@ namespace LI2Sup{
   float  g_map_ds_size;
   int    g_pcd_save_interval;
   bool   g_export_lidar_frame = false;
+  bool   g_export_normals = false;
   
   string g_imu_topic;
   string g_lidar_topic;
