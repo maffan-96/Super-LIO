@@ -21,6 +21,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <Eigen/Core>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <sophus/se3.hpp>
 #include <utility>
@@ -126,6 +130,10 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     RCLCPP_INFO(this->get_logger(), "\tPosition covariance: %.2f", position_covariance_);
     orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
     RCLCPP_INFO(this->get_logger(), "\tOrientation covariance: %.2f", orientation_covariance_);
+    export_lidar_frame_ = declare_parameter<bool>("export_lidar_frame", export_lidar_frame_);
+    RCLCPP_INFO(this->get_logger(), "\tExport lidar-frame scans: %d", export_lidar_frame_);
+    save_map_dir_ = declare_parameter<std::string>("save_map_dir", save_map_dir_);
+    RCLCPP_INFO(this->get_logger(), "\tSave map directory: %s", save_map_dir_.c_str());
 
     config.max_range = declare_parameter<double>("data.max_range", config.max_range);
     RCLCPP_INFO(this->get_logger(), "\tMax range: %.2f", config.max_range);
@@ -176,6 +184,12 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     // Publishing these clouds is a bit costly, so do it only if we are debugging
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
+    }
+    // Mesher-compatible export: the deskewed scan is still in the sensor frame,
+    // and kiss_pose is T_world_lidar regardless of the base_frame setting, so
+    // the pair matches the Super-LIO (ros1) lidar-frame export exactly.
+    if (export_lidar_frame_) {
+        SaveLidarFrameScan(frame, kiss_pose, msg->header);
     }
 }
 
@@ -234,6 +248,89 @@ void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> &frame,
     local_map_header.frame_id = lidar_odom_frame_;
     map_publisher_->publish(std::move(EigenToPointCloud2(kiss_map, local_map_header)));
 }
+void OdometryServer::SaveLidarFrameScan(const std::vector<Eigen::Vector3d> &frame,
+                                        const Sophus::SE3d &pose,
+                                        const std_msgs::msg::Header &header) {
+    namespace fs = std::filesystem;
+    const fs::path out_dir{save_map_dir_};
+    const fs::path pcd_dir = out_dir / "PCD";
+    const fs::path csv_path = out_dir / "slam_poses.csv";
+
+    if (!export_dir_ready_) {
+        export_dir_ready_ = true;
+        std::error_code ec;
+        fs::remove_all(pcd_dir, ec);
+        fs::create_directories(pcd_dir, ec);
+
+        // (Re)create the SLAM pose file (Oxford Spires style): one pose per saved PCD.
+        std::ofstream pose_ofs(csv_path, std::ios::trunc);
+        pose_ofs << "# counter, sec, nsec, x, y, z, qx, qy, qz, qw\n";
+        RCLCPP_INFO(get_logger(),
+                    "LiDAR-frame export enabled: per-scan PCDs + T_world_lidar poses in %s",
+                    fs::absolute(out_dir).string().c_str());
+    }
+
+    if (frame.empty()) return;
+
+    // The trailing <sec>_<nsec> is the join key between each PCD fragment and
+    // its slam_poses.csv line. Taken straight from the integer header stamp,
+    // so simulated clocks that start near zero lose no precision. Unity bags
+    // can stamp consecutive clouds identically (sim-time hiccups); skip those
+    // so an already-saved scan is never silently overwritten.
+    const long sec = static_cast<long>(header.stamp.sec);
+    const long nsec = static_cast<long>(header.stamp.nanosec);
+    if (sec == last_scan_sec_ && nsec == last_scan_nsec_) {
+        RCLCPP_WARN(get_logger(), "Duplicated scan stamp %ld_%09ld, scan not saved", sec, nsec);
+        return;
+    }
+    last_scan_sec_ = sec;
+    last_scan_nsec_ = nsec;
+    scan_counter_++;
+
+    char base[64];
+    std::snprintf(base, sizeof(base), "scans_%ld_%09ld", sec, nsec);
+
+    std::ofstream pcd_ofs(pcd_dir / (std::string(base) + ".pcd"),
+                          std::ios::binary | std::ios::trunc);
+    if (!pcd_ofs.is_open()) {
+        RCLCPP_WARN(get_logger(), "Failed to open PCD file for scan %s", base);
+        return;
+    }
+    pcd_ofs << "# .PCD v0.7 - Point Cloud Data file format\n"
+            << "VERSION 0.7\n"
+            << "FIELDS x y z\n"
+            << "SIZE 4 4 4\n"
+            << "TYPE F F F\n"
+            << "COUNT 1 1 1\n"
+            << "WIDTH " << frame.size() << "\n"
+            << "HEIGHT 1\n"
+            << "VIEWPOINT 0 0 0 1 0 0 0\n"
+            << "POINTS " << frame.size() << "\n"
+            << "DATA binary\n";
+    std::vector<float> data;
+    data.reserve(3 * frame.size());
+    for (const auto &point : frame) {
+        data.emplace_back(static_cast<float>(point.x()));
+        data.emplace_back(static_cast<float>(point.y()));
+        data.emplace_back(static_cast<float>(point.z()));
+    }
+    pcd_ofs.write(reinterpret_cast<const char *>(data.data()),
+                  static_cast<std::streamsize>(data.size() * sizeof(float)));
+
+    // Format: counter, sec, nsec, x, y, z, qx, qy, qz, qw (pose = T_world_lidar)
+    std::ofstream csv_ofs(csv_path, std::ios::app);
+    if (!csv_ofs.is_open()) {
+        RCLCPP_WARN(get_logger(), "Failed to open pose file: %s", csv_path.string().c_str());
+        return;
+    }
+    const Eigen::Vector3d p = pose.translation();
+    const Eigen::Quaterniond q = pose.unit_quaternion();
+    csv_ofs << scan_counter_ << ", " << sec << ", " << nsec << ", "
+            << std::setprecision(9)
+            << p.x() << ", " << p.y() << ", " << p.z() << ", "
+            << q.x() << ", " << q.y() << ", " << q.z() << ", " << q.w() << "\n";
+}
+
 void OdometryServer::ResetService(
     [[maybe_unused]] const std::shared_ptr<std_srvs::srv::Empty::Request> request,
     [[maybe_unused]] std::shared_ptr<std_srvs::srv::Empty::Response> response) {

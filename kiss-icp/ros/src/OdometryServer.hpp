@@ -59,6 +59,13 @@ private:
     void PublishClouds(const std::vector<Eigen::Vector3d> &frame,
                        const std::vector<Eigen::Vector3d> &keypoints,
                        const std_msgs::msg::Header &header);
+
+    /// Save the registered scan (points in the LiDAR sensor frame) as
+    /// PCD/scans_<sec>_<nsec>.pcd and append its T_world_lidar pose to
+    /// slam_poses.csv, matching the Super-LIO (ros1) lidar-frame export.
+    void SaveLidarFrameScan(const std::vector<Eigen::Vector3d> &frame,
+                            const Sophus::SE3d &pose,
+                            const std_msgs::msg::Header &header);
     void ResetService(const std::shared_ptr<std_srvs::srv::Empty::Request> request,
                       std::shared_ptr<std_srvs::srv::Empty::Response> response);
 
@@ -93,6 +100,14 @@ private:
     /// Covariance diagonal
     double position_covariance_;
     double orientation_covariance_;
+
+    /// Per-scan export (Super-LIO ros1 lidar-frame export format).
+    bool export_lidar_frame_{false};
+    std::string save_map_dir_{"kiss_icp_results"};
+    int scan_counter_{-1};
+    bool export_dir_ready_{false};
+    long last_scan_sec_{-1};
+    long last_scan_nsec_{-1};
 };
 
 }  // namespace kiss_icp_ros

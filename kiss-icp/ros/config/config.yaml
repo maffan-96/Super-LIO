@@ -13,12 +13,24 @@ kiss_icp_node:
     # position_covariance: 0.1
     # orientation_covariance: 0.1
 
+    ####    Per-scan export (Super-LIO ros1 lidar-frame format)    ####
+    # Saves every registered scan as <save_map_dir>/PCD/scans_<sec>_<nsec>.pcd
+    # (points in the LiDAR sensor frame) and appends its T_world_lidar pose to
+    # <save_map_dir>/slam_poses.csv (# counter, sec, nsec, x, y, z, qx, qy, qz, qw).
+    # A relative save_map_dir resolves against the directory the node is launched from.
+    export_lidar_frame: True
+    save_map_dir: "kiss_icp_results"
+
     ####    Core KISS-ICP parameters    ####
 
     data:
-      deskew: True
+      # Unity-simulated bags: clouds are rendered at a single instant and carry
+      # no per-point time field, so there is nothing to deskew.
+      deskew: False
       max_range: 100.0
-      min_range: 0.0
+      # Keep a small minimum range so missed Unity raycasts that land at the
+      # sensor origin are dropped instead of fed to the registration.
+      min_range: 0.3
 
     mapping:
       # voxel_size: 1.0 # <- optional, default = max_range / 100.0
